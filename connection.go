@@ -7,10 +7,20 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
-var ErrClosed = errors.New("pool is closed")
+const (
+	DialRetryTimes    = 10
+	ReceiveRetryTimes = 10
+)
+
+var (
+	ErrClosed = errors.New("pool is closed")
+	pools     []*ConnectionPool
+)
 
 type pConn struct {
 	net.Conn
@@ -27,6 +37,15 @@ type ConnectionPool struct {
 	minConns int
 	maxConns int
 	conns    chan net.Conn
+
+	curConns int32
+	l        sync.Mutex
+}
+
+func ReleaseConnections() {
+	for _, pool := range pools {
+		pool.Close()
+	}
 }
 
 func NewConnectionPool(hosts []string, port int, minConns int, maxConns int) (*ConnectionPool, error) {
@@ -38,6 +57,7 @@ func NewConnectionPool(hosts []string, port int, minConns int, maxConns int) (*C
 		port:     port,
 		minConns: minConns,
 		maxConns: maxConns,
+		l:        sync.Mutex{},
 		conns:    make(chan net.Conn, maxConns),
 	}
 	for i := 0; i < minConns; i++ {
@@ -48,6 +68,7 @@ func NewConnectionPool(hosts []string, port int, minConns int, maxConns int) (*C
 		}
 		cp.conns <- conn
 	}
+	pools = append(pools, cp)
 	return cp, nil
 }
 
@@ -62,27 +83,30 @@ func (this *ConnectionPool) Get() (net.Conn, error) {
 		case conn := <-conns:
 			if conn == nil {
 				break
-				//return nil, ErrClosed
 			}
 			if err := this.activeConn(conn); err != nil {
 				break
 			}
 			return this.wrapConn(conn), nil
 		default:
-			if this.Len() >= this.maxConns {
-				errmsg := fmt.Sprintf("Too many connctions %d", this.Len())
-				return nil, errors.New(errmsg)
+			if int(this.curConns) >= this.maxConns {
+				continue
 			}
+
+			this.l.Lock()
+			defer this.l.Unlock()
+
+			if int(this.curConns) >= this.maxConns {
+				continue
+			}
+
 			conn, err := this.makeConn()
 			if err != nil {
 				return nil, err
 			}
-
-			this.conns <- conn
 			return this.wrapConn(conn), nil
 		}
 	}
-
 }
 
 func (this *ConnectionPool) Close() {
@@ -94,20 +118,23 @@ func (this *ConnectionPool) Close() {
 	}
 
 	close(conns)
-
 	for conn := range conns {
 		conn.Close()
 	}
 }
 
-func (this *ConnectionPool) Len() int {
-	return len(this.getConns())
-}
-
-func (this *ConnectionPool) makeConn() (net.Conn, error) {
+func (this *ConnectionPool) makeConn() (conn net.Conn, err error) {
 	host := this.hosts[rand.Intn(len(this.hosts))]
 	addr := fmt.Sprintf("%s:%d", host, this.port)
-	return net.DialTimeout("tcp", addr, time.Minute)
+
+	for retry := 0; retry < DialRetryTimes; retry++ {
+		if conn, err = net.DialTimeout("tcp", addr, time.Minute); err == nil {
+			atomic.AddInt32(&this.curConns, 1)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return
 }
 
 func (this *ConnectionPool) getConns() chan net.Conn {
@@ -127,6 +154,7 @@ func (this *ConnectionPool) put(conn net.Conn) error {
 	case this.conns <- conn:
 		return nil
 	default:
+		atomic.AddInt32(&this.curConns, -1)
 		return conn.Close()
 	}
 }
@@ -183,19 +211,29 @@ func TcpSendFile(conn net.Conn, filename string) error {
 }
 
 func TcpRecvResponse(conn net.Conn, bufferSize int64) ([]byte, int64, error) {
-	recvBuff := make([]byte, 0, bufferSize)
 	tmp := make([]byte, 256)
-	var total int64
+	recvBuff := make([]byte, 0, bufferSize)
+	var (
+		total int64
+		retry int
+	)
 	for {
 		n, err := conn.Read(tmp)
-		total += int64(n)
-		recvBuff = append(recvBuff, tmp[:n]...)
 		if err != nil {
 			if err != io.EOF {
+				if retry < ReceiveRetryTimes {
+					retry++
+
+					time.Sleep(300 * time.Millisecond)
+					continue
+				}
 				return nil, 0, err
 			}
 			break
 		}
+
+		total += int64(n)
+		recvBuff = append(recvBuff, tmp[:n]...)
 		if total == bufferSize {
 			break
 		}

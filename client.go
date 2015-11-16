@@ -1,9 +1,9 @@
 package fdfs_client
 
 import (
+	"sync"
 	"errors"
 	"fmt"
-	"runtime"
 	"strconv"
 	"strings"
 
@@ -11,11 +11,11 @@ import (
 )
 
 var (
-	logger                                          = logrus.New()
-	storagePoolChan      chan *storagePool          = make(chan *storagePool, 1)
-	storagePoolMap       map[string]*ConnectionPool = make(map[string]*ConnectionPool)
-	fetchStoragePoolChan chan interface{}           = make(chan interface{}, 1)
-	quit                 chan bool
+	logger         = logrus.New()
+	poolLock	   = &sync.Mutex{}
+	minPoolSize    = 15
+	maxPoolSize    = 150
+	storagePoolMap = make(map[string]*ConnectionPool)
 )
 
 type FdfsClient struct {
@@ -38,33 +38,8 @@ type storagePool struct {
 
 func init() {
 	logger.Formatter = new(logrus.TextFormatter)
-	runtime.GOMAXPROCS(runtime.NumCPU())
-	go func() {
-		// start a loop
-		for {
-			select {
-			case spd := <-storagePoolChan:
-				if sp, ok := storagePoolMap[spd.storagePoolKey]; ok {
-					fetchStoragePoolChan <- sp
-				} else {
-					var (
-						sp  *ConnectionPool
-						err error
-					)
-					sp, err = NewConnectionPool(spd.hosts, spd.port, spd.minConns, spd.maxConns)
-					if err != nil {
-						fetchStoragePoolChan <- err
-					} else {
-						storagePoolMap[spd.storagePoolKey] = sp
-						fetchStoragePoolChan <- sp
-					}
-				}
-			case <-quit:
-				break
-			}
-		}
-	}()
 }
+
 func getTrackerConf(confPath string) (*Tracker, error) {
 	fc := &FdfsConfigParser{}
 	cf, err := fc.Read(confPath)
@@ -106,7 +81,7 @@ func NewFdfsClient(confPath string) (*FdfsClient, error) {
 		return nil, err
 	}
 
-	trackerPool, err := NewConnectionPool(tracker.HostList, tracker.Port, 10, 150)
+	trackerPool, err := NewConnectionPool(tracker.HostList, tracker.Port, minPoolSize, maxPoolSize)
 	if err != nil {
 		return nil, err
 	}
@@ -115,15 +90,12 @@ func NewFdfsClient(confPath string) (*FdfsClient, error) {
 }
 
 func NewFdfsClientByTracker(tracker *Tracker) (*FdfsClient, error) {
-	trackerPool, err := NewConnectionPool(tracker.HostList, tracker.Port, 10, 150)
+	trackerPool, err := NewConnectionPool(tracker.HostList, tracker.Port, minPoolSize, maxPoolSize)
 	if err != nil {
 		return nil, err
 	}
 
 	return &FdfsClient{tracker: tracker, trackerPool: trackerPool}, nil
-}
-func ColseFdfsClient() {
-	quit <- true
 }
 
 func (this *FdfsClient) UploadByFilename(filename string) (*UploadFileResponse, error) {
@@ -292,33 +264,21 @@ func (this *FdfsClient) DownloadToBuffer(remoteFileId string, offset int64, down
 }
 
 func (this *FdfsClient) getStoragePool(ipAddr string, port int) (*ConnectionPool, error) {
-	hosts := []string{ipAddr}
-	var (
-		storagePoolKey string = fmt.Sprintf("%s-%d", hosts[0], port)
-		result         interface{}
-		err            error
-		ok             bool
-	)
+	storagePoolKey := fmt.Sprintf("%s-%d", ipAddr, port)
+	if pool, ok := storagePoolMap[storagePoolKey]; ok {
+		return pool, nil
+	}
 
-	spd := &storagePool{
-		storagePoolKey: storagePoolKey,
-		hosts:          hosts,
-		port:           port,
-		minConns:       10,
-		maxConns:       150,
+	poolLock.Lock()
+	defer poolLock.Unlock()
+ 	
+	if pool, ok := storagePoolMap[storagePoolKey]; ok {
+		return pool, nil
 	}
-	storagePoolChan <- spd
-	for {
-		select {
-		case result = <-fetchStoragePoolChan:
-			var storagePool *ConnectionPool
-			if err, ok = result.(error); ok {
-				return nil, err
-			} else if storagePool, ok = result.(*ConnectionPool); ok {
-				return storagePool, nil
-			} else {
-				return nil, errors.New("none")
-			}
-		}
+	pool, err := NewConnectionPool([]string{ipAddr}, port, minPoolSize, maxPoolSize)
+	if err == nil {
+		storagePoolMap[storagePoolKey] = pool
+		return pool, err
 	}
+	return nil, err
 }
