@@ -1,14 +1,76 @@
 package fdfs_client
 
 import (
+	"bytes"
+	"strings"
+	"io"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 )
 
+var (
+	C_ZERO = string([]byte{0})
+)
+
 type StorageClient struct {
 	pool *ConnectionPool
+}
+
+func (this *StorageClient) storageUploadLocalFile(storeServ *StorageServer, localFilename string) (*UploadFileResponse, error){
+	const (		
+		MAX_PATH_SIZE = 256
+		PACKAGE_LEN   = 1 +MAX_PATH_SIZE
+		FDFS_GROUP_NAME_MAX_LEN  = 16
+		STORAGE_PROTO_CMD_UPLOAD_LOCAL_FILE = 39
+	)
+
+	filepath := make([]byte, MAX_PATH_SIZE)
+	for i, b := range ([]byte(localFilename)){
+		filepath[i] = b
+	}
+
+	conn, err := this.pool.Get()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	binary.Write(conn, binary.BigEndian, int64(PACKAGE_LEN))
+	binary.Write(conn, binary.BigEndian, byte(STORAGE_PROTO_CMD_UPLOAD_LOCAL_FILE))
+	binary.Write(conn, binary.BigEndian, byte(0))
+	binary.Write(conn, binary.BigEndian, byte(storeServ.storePathIndex))  //path index
+	binary.Write(conn, binary.BigEndian, filepath)
+	
+	responseHeader := make([]byte, 10)
+	if _, err := io.ReadFull(conn, responseHeader); err != nil {
+		return nil, err
+	}
+
+	var (
+		respLen int64
+		cmd     byte
+		status  byte
+	)
+	responseHeaderBuf := bytes.NewBuffer(responseHeader)
+	binary.Read(responseHeaderBuf, binary.BigEndian, &respLen)
+	binary.Read(responseHeaderBuf, binary.BigEndian, &cmd)
+	binary.Read(responseHeaderBuf, binary.BigEndian, &status)
+	if status != 0 {
+		return nil, Errno{int(status)}
+	}
+
+	resp := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+
+	return &UploadFileResponse{
+		GroupName:    strings.Trim(string(resp[:FDFS_GROUP_NAME_MAX_LEN]), C_ZERO), 
+		RemoteFileId: string(resp[FDFS_GROUP_NAME_MAX_LEN:]),
+	}, nil
 }
 
 func (this *StorageClient) storageUploadByFilename(tc *TrackerClient,
