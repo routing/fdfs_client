@@ -27,12 +27,17 @@ type pConn struct {
 	pool *ConnectionPool
 }
 
+type Host struct {
+	host  string
+	alive bool
+}
+
 func (c pConn) Close() error {
 	return c.pool.put(c.Conn)
 }
 
 type ConnectionPool struct {
-	hosts    []string
+	hosts    []*Host
 	port     int
 	minConns int
 	maxConns int
@@ -40,6 +45,7 @@ type ConnectionPool struct {
 
 	curConns int32
 	l        sync.Mutex
+	closed   bool
 }
 
 func ReleaseConnections() {
@@ -52,14 +58,20 @@ func NewConnectionPool(hosts []string, port int, minConns int, maxConns int) (*C
 	if minConns < 0 || maxConns <= 0 || minConns > maxConns {
 		return nil, errors.New("invalid conns settings")
 	}
+
 	cp := &ConnectionPool{
-		hosts:    hosts,
+		hosts:    make([]*Host, len(hosts)),
 		port:     port,
 		minConns: minConns,
 		maxConns: maxConns,
 		l:        sync.Mutex{},
 		conns:    make(chan net.Conn, maxConns),
 	}
+
+	for i :=0; i < len(hosts); i++ {
+		cp.hosts[i] = &Host{hosts[i], true}
+	}
+
 	for i := 0; i < minConns; i++ {
 		conn, err := cp.makeConn()
 		if err != nil {
@@ -68,8 +80,32 @@ func NewConnectionPool(hosts []string, port int, minConns int, maxConns int) (*C
 		}
 		cp.conns <- conn
 	}
+
+	go cp.StartHealthCheck()
 	pools = append(pools, cp)
 	return cp, nil
+}
+
+func (this *ConnectionPool) StartHealthCheck() {
+	var (
+		addr string
+		conn net.Conn
+		err  error
+	)
+	for !this.closed {
+		for _, host := range this.hosts {
+			if !host.alive {
+				addr = fmt.Sprintf("%s:%d", host, this.port)
+				if conn, err = net.DialTimeout("tcp", addr, 10 * time.Second); err == nil {
+					fmt.Printf("%s alived\n", addr)
+					host.alive = true
+					conn.Close()
+				}
+			}
+		}
+
+		time.Sleep(10 * time.Second)
+	}
 }
 
 func (this *ConnectionPool) Get() (net.Conn, error) {
@@ -112,6 +148,7 @@ func (this *ConnectionPool) Get() (net.Conn, error) {
 func (this *ConnectionPool) Close() {
 	conns := this.conns
 	this.conns = nil
+	this.closed = true
 
 	if conns == nil {
 		return
@@ -124,11 +161,30 @@ func (this *ConnectionPool) Close() {
 }
 
 func (this *ConnectionPool) makeConn() (conn net.Conn, err error) {
-	host := this.hosts[rand.Intn(len(this.hosts))]
+	aliveHosts := make([]*Host, 0, len(this.hosts))
+	for _, host := range this.hosts {
+		if host.alive {
+			aliveHosts = append(aliveHosts, host)
+		}
+	}
+
+	if len(aliveHosts) == 0 {
+		return nil, errors.New("no alive hosts")
+	}
+
+	host := aliveHosts[rand.Intn(len(aliveHosts))]
+	if conn, err = this.makeConnInternal(host.host); err != nil {
+		host.alive = false
+		return this.makeConn()
+	}
+	return
+}
+
+func  (this *ConnectionPool) makeConnInternal(host string) (conn net.Conn, err error) {
 	addr := fmt.Sprintf("%s:%d", host, this.port)
 
 	for retry := 0; retry < DialRetryTimes; retry++ {
-		if conn, err = net.DialTimeout("tcp", addr, time.Minute); err == nil {
+		if conn, err = net.DialTimeout("tcp", addr, 15 * time.Second); err == nil {
 			atomic.AddInt32(&this.curConns, 1)
 			return
 		}
@@ -136,6 +192,7 @@ func (this *ConnectionPool) makeConn() (conn net.Conn, err error) {
 	}
 	return
 }
+
 
 func (this *ConnectionPool) getConns() chan net.Conn {
 	conns := this.conns
@@ -173,7 +230,7 @@ func (this *ConnectionPool) activeConn(conn net.Conn) error {
 	if th.cmd == 100 && th.status == 0 {
 		return nil
 	}
-	return errors.New("Conn unaliviable")
+	return errors.New("Conn unavailable")
 }
 
 func TcpSendData(conn net.Conn, bytesStream []byte) error {
