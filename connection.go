@@ -13,8 +13,10 @@ import (
 )
 
 const (
-	DialRetryTimes    = 10
-	ReceiveRetryTimes = 10
+	DialRetryTimes      = 10
+	ReceiveRetryTimes   = 10
+	MaxFailCount        = 3
+	HealthCheckInterval = 5 * time.Second
 )
 
 var (
@@ -28,8 +30,10 @@ type pConn struct {
 }
 
 type Host struct {
-	host  string
-	alive bool
+	host      string
+	alive     bool
+	failCount int
+	curConns  int32
 }
 
 func (c pConn) Close() error {
@@ -69,7 +73,7 @@ func NewConnectionPool(hosts []string, port int, minConns int, maxConns int) (*C
 	}
 
 	for i :=0; i < len(hosts); i++ {
-		cp.hosts[i] = &Host{hosts[i], true}
+		cp.hosts[i] = &Host{hosts[i], true, 0, 0}
 	}
 
 	for i := 0; i < minConns; i++ {
@@ -81,30 +85,41 @@ func NewConnectionPool(hosts []string, port int, minConns int, maxConns int) (*C
 		cp.conns <- conn
 	}
 
-	go cp.StartHealthCheck()
+	go cp.doHealthCheck()
 	pools = append(pools, cp)
 	return cp, nil
 }
 
-func (this *ConnectionPool) StartHealthCheck() {
-	var (
-		addr string
-		conn net.Conn
-		err  error
-	)
+func (this *ConnectionPool) doHealthCheck() {
 	for !this.closed {
-		for _, host := range this.hosts {
-			if !host.alive {
-				addr = fmt.Sprintf("%s:%d", host, this.port)
-				if conn, err = net.DialTimeout("tcp", addr, 10 * time.Second); err == nil {
-					fmt.Printf("%s alived\n", addr)
-					host.alive = true
-					conn.Close()
-				}
-			}
+		this.check()
+		time.Sleep(HealthCheckInterval)
+	}
+}
+
+func (this *ConnectionPool) check() {
+	var (
+		err         error
+		addr        string
+		conn        net.Conn
+		originAlive bool
+	)
+
+	for _, host := range this.hosts {
+		originAlive = host.alive
+		addr = this.getFullAddr(host)
+		if conn, err = net.DialTimeout("tcp", addr, 1 * time.Second); err == nil {
+			host.failCount = 0
+			host.alive = true
+			conn.Close()
+		} else {
+			host.failCount += 1
+			host.alive = host.failCount < MaxFailCount
 		}
 
-		time.Sleep(10 * time.Second)
+		if originAlive != host.alive {
+			logger.Warnf("Host `%s` status changed, %v -> %v", addr, originAlive, host.alive)
+		}
 	}
 }
 
@@ -121,6 +136,7 @@ func (this *ConnectionPool) Get() (net.Conn, error) {
 				break
 			}
 			if err := this.activeConn(conn); err != nil {
+				this.wrapClose(conn)
 				break
 			}
 			return this.wrapConn(conn), nil
@@ -156,7 +172,7 @@ func (this *ConnectionPool) Close() {
 
 	close(conns)
 	for conn := range conns {
-		conn.Close()
+		this.wrapClose(conn)
 	}
 }
 
@@ -169,13 +185,18 @@ func (this *ConnectionPool) makeConn() (conn net.Conn, err error) {
 	}
 
 	if len(aliveHosts) == 0 {
-		return nil, errors.New("no alive hosts")
+		return nil, errors.New("No available hosts")
 	}
 
 	host := aliveHosts[rand.Intn(len(aliveHosts))]
 	if conn, err = this.makeConnInternal(host.host); err != nil {
+		logger.Warnf("Host `%s:%d` is dead\n", host.host, this.port)
+
 		host.alive = false
 		return this.makeConn()
+	} else {
+		atomic.AddInt32(&this.curConns, 1)
+		atomic.AddInt32(&host.curConns, 1)
 	}
 	return
 }
@@ -185,8 +206,7 @@ func  (this *ConnectionPool) makeConnInternal(host string) (conn net.Conn, err e
 
 	for retry := 0; retry < DialRetryTimes; retry++ {
 		if conn, err = net.DialTimeout("tcp", addr, 15 * time.Second); err == nil {
-			atomic.AddInt32(&this.curConns, 1)
-			return
+			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -206,15 +226,41 @@ func (this *ConnectionPool) put(conn net.Conn) error {
 	if this.conns == nil {
 		return conn.Close()
 	}
+	
+	//rebalance
+	avg := int32(this.maxConns / len(this.hosts))
+	if host, err := this.findHostByConn(conn); err == nil && host.curConns > avg {
+		return this.wrapClose(conn)
+	}
 
 	select {
 	case this.conns <- conn:
 		return nil
 	default:
-		atomic.AddInt32(&this.curConns, -1)
-		return conn.Close()
+		return this.wrapClose(conn)
 	}
 }
+
+func (this *ConnectionPool) findHostByConn(conn net.Conn) (*Host, error) {
+	for _, h := range this.hosts {
+		if conn.RemoteAddr().String() == this.getFullAddr(h) {
+			return h, nil
+		}
+	}
+	return nil, errors.New("Unreachable code")
+}
+
+func (this *ConnectionPool) getFullAddr(host *Host) string {
+	return fmt.Sprintf("%s:%d", host.host, this.port)
+}
+
+func (this *ConnectionPool) wrapClose(conn net.Conn) error {
+	if h, err := this.findHostByConn(conn); err == nil {
+		atomic.AddInt32(&h.curConns, -1)
+	}
+	atomic.AddInt32(&this.curConns, -1)
+	return conn.Close()
+} 
 
 func (this *ConnectionPool) wrapConn(conn net.Conn) net.Conn {
 	c := pConn{pool: this}
@@ -230,6 +276,7 @@ func (this *ConnectionPool) activeConn(conn net.Conn) error {
 	if th.cmd == 100 && th.status == 0 {
 		return nil
 	}
+	
 	return errors.New("Conn unavailable")
 }
 
